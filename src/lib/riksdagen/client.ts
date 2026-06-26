@@ -1,4 +1,5 @@
 
+
 import { cleanHtml, truncateText } from "./clean-html";
 import type { SfsDocument, SfsSearchResult } from "./types";
 
@@ -16,65 +17,47 @@ function normalizeText(value: string): string {
 
 function getQueryTerms(query?: string): string[] {
   if (!query) return [];
-
   return query
     .toLowerCase()
     .split(/\s+/)
-    .map((term) => term.trim())
+    .map((t) => t.trim())
     .filter(Boolean)
-    .filter((term) => term.length >= 3);
+    .filter((t) => t.length >= 3);
 }
 
 /**
- * Finds query occurrences and prefers locations that look like actual statute
- * text rather than table of contents or metadata.
- *
- * This is intentionally generic:
- * - no pre-coded legal answers
- * - no hardcoded chapter mappings
- * - no mocked law text
+ * Returns { start, end } indices of the best chapter window around
+ * the highest-scoring query match. Never re-searches for the snippet
+ * by value — works entirely with indices.
  */
-function extractAroundBestQueryMatch(
+function findBestChapterWindow(
   text: string,
-  query?: string,
+  query: string,
   maxLength = 12000
-): string | null {
+): { start: number; end: number } | null {
   const terms = getQueryTerms(query);
   if (terms.length === 0) return null;
 
   const lowerText = text.toLowerCase();
-
   const candidates: { index: number; score: number }[] = [];
 
   for (const term of terms) {
     let idx = lowerText.indexOf(term);
-
     while (idx !== -1) {
-      const before = text.slice(Math.max(0, idx - 1500), idx);
-      const after = text.slice(idx, Math.min(text.length, idx + 3000));
-      const window = `${before}\n${after}`;
+      const winStart = Math.max(0, idx - 1500);
+      const winEnd = Math.min(text.length, idx + 3000);
+      const window = text.slice(winStart, winEnd);
 
       let score = 0;
-
-      // Prefer actual statute body text containing section markers.
       if (/\n\s*\d+\s*§/.test(window)) score += 20;
       if (/\n\s*\d+\s*a\s*§/i.test(window)) score += 15;
-
-      // Prefer chapter-like context.
       if (/\n\s*\d+\s+kap\./i.test(window)) score += 10;
-
-      // Prefer dense matches.
-      for (const otherTerm of terms) {
-        if (window.toLowerCase().includes(otherTerm)) {
-          score += 3;
-        }
+      for (const other of terms) {
+        if (window.toLowerCase().includes(other)) score += 3;
       }
-
-      // Penalize very early metadata/table-of-contents area slightly.
       if (idx < 2000) score -= 5;
 
       candidates.push({ index: idx, score });
-
       idx = lowerText.indexOf(term, idx + term.length);
     }
   }
@@ -82,44 +65,42 @@ function extractAroundBestQueryMatch(
   if (candidates.length === 0) return null;
 
   candidates.sort((a, b) => b.score - a.score);
+  const bestIdx = candidates[0].index;
 
-  const bestIndex = candidates[0].index;
-
-  const start = Math.max(0, bestIndex - 3000);
-  const end = Math.min(text.length, start + maxLength);
-
-  return text.slice(start, end);
-}
-
-/**
- * Generic chapter extraction when the best query match appears inside a chapter.
- * This tries to include the surrounding chapter body without hardcoding what
- * that chapter means legally.
- */
-function expandToNearbyChapter(text: string, snippet: string): string {
-  const snippetIndex = text.indexOf(snippet);
-  if (snippetIndex === -1) return snippet;
-
-  const before = text.slice(0, snippetIndex);
+  // Walk backward to find the start of the enclosing chapter
+  const before = text.slice(0, bestIdx);
   const chapterMatches = [...before.matchAll(/\n\s*\d+\s+kap\.[^\n]*/gi)];
 
-  if (chapterMatches.length === 0) {
-    return snippet;
+  let chapterStart: number;
+  if (chapterMatches.length > 0) {
+    const last = chapterMatches[chapterMatches.length - 1];
+    chapterStart = last.index ?? Math.max(0, bestIdx - 3000);
+  } else {
+    chapterStart = Math.max(0, bestIdx - 3000);
   }
 
-  const lastChapter = chapterMatches[chapterMatches.length - 1];
-  const chapterStart = lastChapter.index ?? snippetIndex;
-
+  // Walk forward to find the end of the enclosing chapter
   const afterChapter = text.slice(chapterStart + 1);
-  const nextChapterMatch = /\n\s*\d+\s+kap\.[^\n]*/i.exec(afterChapter);
+  const nextChapter = /\n\s*\d+\s+kap\.[^\n]*/i.exec(afterChapter);
 
-  if (!nextChapterMatch || nextChapterMatch.index === undefined) {
-    return text.slice(chapterStart, Math.min(text.length, chapterStart + 12000));
+  let chapterEnd: number;
+  if (nextChapter && nextChapter.index !== undefined) {
+    chapterEnd = chapterStart + 1 + nextChapter.index;
+  } else {
+    chapterEnd = text.length;
   }
 
-  const chapterEnd = chapterStart + 1 + nextChapterMatch.index;
+  // Enforce a minimum window size of 500 chars.
+  // When the chapter boundaries land on adjacent headers (e.g. in a
+  // table of contents), the window can be as small as 1 character.
+  const MIN_WINDOW = 500;
+  if (chapterEnd - chapterStart < MIN_WINDOW) {
+    chapterEnd = Math.min(text.length, chapterStart + maxLength);
+  }
 
-  return text.slice(chapterStart, Math.min(chapterEnd, chapterStart + 12000));
+  // Clamp to maxLength
+  const end = Math.min(chapterEnd, chapterStart + maxLength);
+  return { start: chapterStart, end };
 }
 
 function extractRelevantSection(
@@ -127,24 +108,53 @@ function extractRelevantSection(
   title: string,
   query?: string
 ): string {
-  const lowerTitle = title.toLowerCase();
-  const lowerQuery = query?.toLowerCase();
+  if (!text || text.length < 10) return text;
 
-  /**
-   * If the query is the actual document title, returning the beginning is fine.
-   */
-  if (lowerQuery && lowerTitle.includes(lowerQuery)) {
-    return truncateText(text, 12000);
-  }
+  if (query) {
+    const window = findBestChapterWindow(text, query, 12000);
+    if (window) {
+      const extracted = text.slice(window.start, window.end);
+      console.log("Chapter window found, length:", extracted.length);
 
-  const queryBasedSnippet = extractAroundBestQueryMatch(text, query, 12000);
-
-  if (queryBasedSnippet && queryBasedSnippet.length > 300) {
-    const expanded = expandToNearbyChapter(text, queryBasedSnippet);
-    return truncateText(expanded, 12000);
+      // Quality gate: only use the chapter window if it contains
+      // meaningful content. Otherwise fall back to the full text.
+      if (extracted.trim().length > 200) {
+        return truncateText(extracted, 12000);
+      }
+      console.log("Chapter window too small, falling back to full text");
+    } else {
+      console.log("No chapter window found — returning full text truncated");
+    }
   }
 
   return truncateText(text, 12000);
+}
+
+function extractRawText(document: any): string {
+  const sources = [
+    document.html,
+    document.text,
+    document.anforande?.anforandetext,
+    document.filbilaga?.text,
+  ];
+
+  for (const source of sources) {
+    if (typeof source === "string" && source.trim().length > 200) {
+      const cleaned = cleanHtml(source);
+      if (cleaned.length > 200) {
+        console.log("Text source: document field, cleaned length:", cleaned.length);
+        return cleaned;
+      }
+    }
+  }
+
+  const fallback = Object.values(document)
+    .filter((v): v is string => typeof v === "string" && v.length > 100)
+    .map((v) => cleanHtml(v))
+    .join("\n\n");
+
+  console.log("Text source: fallback concat, length:", fallback.length);
+  return fallback;
 }
 
 function scoreSearchResult(
@@ -157,22 +167,25 @@ function scoreSearchResult(
   const normalizedSfsNumber = normalizeText(result.sfsNumber);
 
   let score = 1000 - index;
-
-  /**
-   * Generic ranking only.
-   * No hardcoded legal conclusions.
-   */
   if (normalizedTitle.includes(normalizedQuery)) score += 500;
   if (normalizedSfsNumber.includes(normalizedQuery)) score += 300;
 
-  const queryTerms = getQueryTerms(query);
-
-  for (const term of queryTerms) {
+  for (const term of getQueryTerms(query)) {
     if (normalizedTitle.includes(term)) score += 100;
     if (normalizedSfsNumber.includes(term)) score += 50;
   }
 
   if (result.id.startsWith("sfs-")) score += 25;
+
+  // Boost primary legislation (balkar and named lagar) over förordningar.
+  // Balkar are comprehensive statutes that cover entire legal areas —
+  // they are almost always the correct primary source.
+  if (/balk\b/i.test(normalizedTitle)) score += 300;
+  if (/^lag\s/i.test(normalizedTitle)) score += 150;
+
+  // Penalize förordningar — they are secondary regulations, rarely the
+  // primary source a user needs for general legal questions.
+  if (/förordning/i.test(normalizedTitle)) score -= 200;
 
   return score;
 }
@@ -185,9 +198,7 @@ export async function searchSfs(query: string): Promise<SfsSearchResult[]> {
   console.log("Query:", trimmedQuery);
   console.log("========================\n");
 
-  if (!trimmedQuery) {
-    return [];
-  }
+  if (!trimmedQuery) return [];
 
   const url =
     `${RIKSDAGEN_BASE_URL}/dokumentlista/` +
@@ -201,16 +212,11 @@ export async function searchSfs(query: string): Promise<SfsSearchResult[]> {
   console.log("Search URL:", url);
 
   const response = await fetch(url, {
-    headers: {
-      "User-Agent": USER_AGENT,
-      Accept: "application/json",
-    },
+    headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
     cache: "no-store",
   });
 
-  if (!response.ok) {
-    throw new Error(`Riksdagen search failed: ${response.status}`);
-  }
+  if (!response.ok) throw new Error(`Riksdagen search failed: ${response.status}`);
 
   const data = await response.json();
   const docs = toArray(data?.dokumentlista?.dokument);
@@ -258,9 +264,7 @@ export async function getSfsDocument(
   console.log("Query:", query);
   console.log("========================\n");
 
-  if (!trimmedId) {
-    return null;
-  }
+  if (!trimmedId) return null;
 
   const url =
     `${RIKSDAGEN_BASE_URL}/dokument/` +
@@ -269,10 +273,7 @@ export async function getSfsDocument(
   console.log("Retrieve URL:", url);
 
   const response = await fetch(url, {
-    headers: {
-      "User-Agent": USER_AGENT,
-      Accept: "application/json",
-    },
+    headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
     cache: "no-store",
   });
 
@@ -285,18 +286,15 @@ export async function getSfsDocument(
   const document = data?.dokumentstatus?.dokument;
 
   if (!document) {
-    console.log("No document found");
+    console.log("No document found in response");
     return null;
   }
 
-  const html = document.html || "";
-  const cleanedHtml = cleanHtml(html);
+  console.log("html field length:", (document.html ?? "").length);
+  console.log("text field length:", (document.text ?? "").length);
 
-  const cleanedText = extractRelevantSection(
-    cleanedHtml,
-    document.titel || "",
-    query
-  );
+  const rawText = extractRawText(document);
+  const cleanedText = extractRelevantSection(rawText, document.titel || "", query);
 
   console.log("Document Title:", document.titel);
   console.log("SFS Number:", document.beteckning);

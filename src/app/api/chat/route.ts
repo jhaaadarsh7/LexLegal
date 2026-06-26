@@ -50,7 +50,7 @@ export async function POST(req: Request) {
        *
        * Lowering this prevents tool loops.
        */
-      stopWhen: stepCountIs(8),
+      stopWhen: stepCountIs(15),
 
       tools: {
         searchSfs: tool({
@@ -58,7 +58,8 @@ export async function POST(req: Request) {
             "Search Swedish SFS statutes from Riksdagen. " +
             "Use this only to find possible SFS documents. " +
             "Search results are not legal evidence. " +
-            "Use short Swedish legal keywords, usually one to three words.",
+            "Use short Swedish legal keywords, usually one to three words. " +
+            "Do NOT call this more than 3 times per user question.",
 
           inputSchema: z.object({
             query: z
@@ -97,12 +98,11 @@ export async function POST(req: Request) {
             return {
               query,
               count: results.length,
-              suggestedId: results[0]?.id,
-              suggestedTitle: results[0]?.title,
-              suggestedSfsNumber: results[0]?.sfsNumber,
               requiresRetrieval: true,
               instruction:
-                "These search results are only for locating documents. Choose the most relevant result and call getSfsDocument before making any legal claim.",
+                "Review the results below and choose the MOST relevant document. " +
+                "Prefer comprehensive statutes (balkar like Jordabalk, Brottsbalk) over förordningar. " +
+                "Call getSfsDocument with the chosen document's id before making any legal claim.",
               results,
             };
           },
@@ -162,7 +162,10 @@ export async function POST(req: Request) {
               found: true,
               retrieved: true,
               instruction:
-                "Use only this retrieved document text as legal evidence. If the text supports the answer, answer now. Do not continue searching unless the user's question clearly asks about another separate legal area.",
+                "STOP SEARCHING. You now have retrieved document text. " +
+                "Answer the user's question using this text immediately. " +
+                "Do NOT call searchSfs or getSfsDocument again unless the user's question explicitly asks about a completely different legal area. " +
+                "If this text does not fully answer the question, answer with what you have and note any limitations.",
               document,
             };
           },
@@ -179,8 +182,8 @@ export async function POST(req: Request) {
         if (finishReason !== "stop") {
           console.warn(
             `⚠️  Generation ended with finishReason="${finishReason}" ` +
-              `instead of "stop" — the answer may be truncated. ` +
-              `Check stepCountIs(8) and maxDuration limits.`
+            `instead of "stop" — the answer may be truncated. ` +
+            `Check stepCountIs(15) and maxDuration limits.`
           );
         }
 
